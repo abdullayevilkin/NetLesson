@@ -1,98 +1,72 @@
-using System.Text.Json;
-using Microsoft.Net.Http.Headers;
+// MIDDLEWARE — HTTP sorğusu ilə cavab arasında işləyən kod parçasıdır.
+// Sorğu middleware-lərdən ardıcıl keçir (buna "pipeline" deyilir),
+// cavab isə eyni yolla TƏRS sıra ilə geri qayıdır:
+//
+//   Sorğu  →  [1] → [2] → [3] → [4] app.Run
+//   Cavab  ←  [1] ← [2] ← [3] ←
+//
+// Middleware-lərin sırası vacibdir: burada necə yazılıbsa, o sıra ilə işləyir.
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-var product = new { Id = 1, Name = "Laptop", Price = 1500 };
-string[] supportedTypes = ["application/json", "application/xml", "text/plain"];
-var extensions = new Dictionary<string, string>
-{
-    ["json"] = "application/json",
-    ["xml"] = "application/xml",
-    ["txt"] = "text/plain",
-};
-
+// [1] INLINE MIDDLEWARE (app.Use)
+// next() növbəti middleware-i çağırır.
+// next()-dən ƏVVƏLKİ kod sorğu gedəndə, SONRAKI kod cavab qayıdanda işləyir.
 app.Use(async (context, next) =>
 {
-    var path = context.Request.Path.Value ?? "";
+    Console.WriteLine($"[1] Sorğu gəldi: {context.Request.Method} {context.Request.Path}");
 
-    // Server-driven: client Accept header göndərir, formatı SERVER seçir
-    if (path == "/server-driven")
+    await next();
+
+    Console.WriteLine($"[1] Cavab qayıtdı: status {context.Response.StatusCode}");
+});
+
+// [2] SHORT-CIRCUIT (pipeline-ı yarıda kəsmək)
+// next() çağırılmasa, sonrakı middleware-lər ümumiyyətlə işləmir.
+// Tipik istifadə: icazə yoxlaması, rate limiting, "saytda təmir işləri gedir" səhifəsi.
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path == "/admin")
     {
-        context.Response.Headers.Vary = "Accept";
-        var accepts = context.Request.GetTypedHeaders().Accept;
-
-        var chosen = accepts.Count == 0
-            ? supportedTypes[0]
-            : accepts
-                .Where(a => a.Quality != 0)
-                .OrderByDescending(a => a.Quality ?? 1)
-                .SelectMany(a => supportedTypes.Where(s => new MediaTypeHeaderValue(s).IsSubsetOf(a)))
-                .FirstOrDefault();
-
-        if (chosen is null)
-        {
-            context.Response.StatusCode = StatusCodes.Status406NotAcceptable;
-            await context.Response.WriteAsync("Dəstəklənən formatlar: " + string.Join(", ", supportedTypes));
-            return;
-        }
-
-        await WriteProduct(context, chosen);
-        return;
-    }
-
-    // Agent-driven: server variantların siyahısını qaytarır, CLIENT özü seçir
-    if (path == "/agent-driven")
-    {
-        context.Response.StatusCode = StatusCodes.Status300MultipleChoices;
-        context.Response.Headers.Link = string.Join(", ",
-            extensions.Select(e => $"</agent-driven/product.{e.Key}>; rel=\"alternate\"; type=\"{e.Value}\""));
-        await context.Response.WriteAsJsonAsync(
-            extensions.Select(e => new { url = $"/agent-driven/product.{e.Key}", type = e.Value }));
-        return;
-    }
-
-    if (path.StartsWith("/agent-driven/product."))
-    {
-        var ext = path["/agent-driven/product.".Length..];
-        if (extensions.TryGetValue(ext, out var mediaType))
-        {
-            await WriteProduct(context, mediaType);
-            return;
-        }
-        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        Console.WriteLine("[2] /admin bloklandı, next() çağırılmır");
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsync("Giriş qadağandır");
         return;
     }
 
     await next();
 });
 
-//app.MapGet("/", () => "Hello World!");
-app.Run(async (HttpContext context) =>
-{
-    if(context.Request.Method == "GET")
-    {
-        if (context.Request.Query.ContainsKey("id"))
-        {
-            string id = context.Request.Query["id"];
-            await context.Response.WriteAsync("this is id " + id);
+// [3] CLASS ŞƏKLİNDƏ MIDDLEWARE
+// Real layihələrdə çox vaxt bu forma işlədilir: kod ayrıca class-da olur,
+// test etmək və başqa layihədə təkrar istifadə etmək asan olur.
+// Class aşağıda, faylın sonundadır.
+app.UseMiddleware<RequestTimingMiddleware>();
 
-        }
-    }
+// [4] TERMINAL MIDDLEWARE (app.Run(handler))
+// next parametri yoxdur, pipeline həmişə burada bitir.
+app.Run(async context =>
+{
+    Console.WriteLine("[4] app.Run: cavab yazılır");
+    await context.Response.WriteAsync("Salam, middleware!");
 });
 
-
+// Bu isə başqa şeydir: parametrsiz app.Run() server-i işə salır.
 app.Run();
 
-async Task WriteProduct(HttpContext context, string mediaType)
+// Class middleware qaydaları:
+// - Konstruktor RequestDelegate qəbul edir, bu növbəti middleware-dir
+// - InvokeAsync(HttpContext) adlı metodu olmalıdır
+class RequestTimingMiddleware(RequestDelegate next)
 {
-    context.Response.ContentType = mediaType;
-    var body = mediaType switch
+    public async Task InvokeAsync(HttpContext context)
     {
-        "application/json" => JsonSerializer.Serialize(product),
-        "application/xml" => $"<product><id>{product.Id}</id><name>{product.Name}</name><price>{product.Price}</price></product>",
-        _ => $"Id: {product.Id}, Name: {product.Name}, Price: {product.Price}",
-    };
-    await context.Response.WriteAsync(body);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine("[3] Vaxt ölçülməyə başladı");
+
+        await next(context);
+
+        Console.WriteLine($"[3] Sorğu {stopwatch.ElapsedMilliseconds} ms çəkdi");
+    }
 }
